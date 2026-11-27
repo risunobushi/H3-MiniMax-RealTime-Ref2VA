@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "H3 MiniMax real-time Ref2VA: live video try-on on a single GPU"
+type: software
+authors:
+  - family-names: Baioni
+    given-names: Andrea
+repository-code: "https://github.com/risunobushi/H3-MiniMax-RealTime-Ref2VA"
+license: Apache-2.0
+date-released: 2026-11-27

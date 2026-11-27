@@ -1,0 +1,20 @@
+# Runtime pins the numbers in docs/ were measured with (src/setup/setup_live.sh installs exactly this and picks the
+# torch wheel: cu128 for Hopper, cu130 for Blackwell). Install torch first from the matching index, then this file:
+#   pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+diffusers==0.40.0
+transformers>=4.57
+accelerate
+peft
+bitsandbytes
+kernels==0.16.0
+av
+einops
+huggingface_hub
+hf_xet
+sentencepiece
+imageio
+imageio-ffmpeg
+fastapi
+uvicorn[standard]
+websockets
+python-multipart

@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>H3 Live Mirror</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0b0d; color: #ddd; font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  #top { display: flex; gap: 8px; align-items: center; padding: 8px 10px; flex-wrap: wrap; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid #444; background: #1d1d22; color: #eee; }
+  button:disabled { opacity: .5; }
+  #stage { display: flex; gap: 8px; justify-content: center; padding: 0 8px 8px; }
+  /* --ar = width / height of the session (set from the camera once it starts); both panes share it and fit the viewport */
+  #stage { --ar: 0.5625; }
+  .pane { position: relative; width: min(46vw, calc(72vh * var(--ar)), 640px); aspect-ratio: var(--ar); background: #000; border-radius: 10px; overflow: hidden; }
+  .pane canvas, .pane video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .pane .cap { position: absolute; left: 0; right: 0; bottom: 0; padding: 4px 8px; background: rgba(0,0,0,.55); font-size: 12px; }
+  #stats { padding: 4px 10px 12px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; }
+  #lag { font-size: 22px; font-weight: 600; color: #7fe0a0; }
+  select { font: inherit; background: #1d1d22; color: #eee; border: 1px solid #444; border-radius: 8px; padding: 6px; }
+  #picker { display: flex; gap: 8px; align-items: center; padding: 0 10px 8px; flex-wrap: wrap; }
+  #picker .lbl { font-size: 12px; color: #999; }
+  #thumbs img { width: 56px; height: 56px; object-fit: contain; background: #fff; border-radius: 8px; border: 2px solid transparent; margin-right: 4px; cursor: pointer; }
+  #thumbs img.sel { border-color: #7fe0a0; }
+</style>
+</head>
+<body>
+<div id="top">
+  <button id="start">Start camera + stream</button>
+  <button id="stop" disabled>Stop</button>
+  <select id="facing"><option value="user">front camera</option><option value="environment">back camera</option></select>
+  <select id="camdev" title="camera device (desktop: pick the real webcam, not a virtual one)"><option value="">default camera</option></select>
+  <span id="conn">disconnected</span>
+</div>
+<div id="picker">
+  <span class="lbl">framing</span>
+  <select id="framing"><option value="auto">auto (same as camera)</option><option value="selfie">selfie / close-up</option><option value="half">half body</option><option value="full">full body</option></select>
+  <span class="lbl" id="libLbl">garment</span><span id="thumbs"></span>
+</div>
+<div id="stage">
+  <video id="cam" autoplay muted playsinline style="position:fixed;left:-10000px;top:0;width:288px;height:512px"></video>
+  <div class="pane"><canvas id="sent"></canvas><div class="cap" id="sentCap">camera (what is sent, 24 fps)</div></div>
+  <div class="pane"><canvas id="out"></canvas><div class="cap" id="outCap">generated (garment swapped)</div></div>
+</div>
+<div id="stats">lag: <span id="lag">-</span>
+<span id="detail">waiting...</span></div>
+<script>
+(() => {
+  const qs = new URLSearchParams(location.search);
+  const token = qs.get("token") || "";
+  const FPS = 24;
+  const SEND_Q = 0.7;
+  let ws = null, stream = null, sending = false, sendTimer = null, wanted = false, pingTimer = null;
+  let hello = null, clockOffset = 0; // server_time - client_time (seconds)
+  const cam = document.getElementById("cam");
+  const out = document.getElementById("out");
+  const octx = out.getContext("2d");
+  // the left pane shows the frames actually sent (Chrome on Windows can stop repainting a <video> next to busy
+  // canvases, while the track keeps delivering frames); the <video> stays off-screen, not display:none, so it decodes
+  const capCanvas = document.getElementById("sent");
+  const cctx = capCanvas.getContext("2d");
+  const lagEl = document.getElementById("lag"), detEl = document.getElementById("detail"), connEl = document.getElementById("conn");
+  const framingEl = document.getElementById("framing"), thumbsEl = document.getElementById("thumbs");
+  let curGarment = null;
+  function sendConfig(garment, framing) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "config", garment: garment, framing: framing }));
+  }
+  function renderThumbs(names) {
+    thumbsEl.innerHTML = "";
+    names.forEach((n) => {
+      const img = document.createElement("img"); img.src = "/garments/" + encodeURIComponent(n); img.title = n; img.dataset.name = n;
+      if (n === curGarment) img.classList.add("sel");
+      img.onclick = () => { sendConfig(n, framingEl.value); };
+      thumbsEl.appendChild(img);
+    });
+  }
+  function markGarment(n) {
+    curGarment = n;
+    thumbsEl.querySelectorAll("img").forEach((im) => im.classList.toggle("sel", im.dataset.name === n));
+  }
+  framingEl.onchange = () => sendConfig(curGarment, framingEl.value);
+  const FRAMING_LABELS = { auto: "auto (same as camera)", selfie: "selfie / close-up", half: "half body", full: "full body" };
+  function applyTask(task, framings) {  // garment (default) or lipstick: library label, caption, framing options
+    const lip = task === "lipstick";
+    document.getElementById("libLbl").textContent = lip ? "shade" : "garment";
+    document.getElementById("outCap").textContent = lip ? "generated (lipstick applied)" : "generated (garment swapped)";
+    if (framings) framingEl.innerHTML = framings.map((f) => '<option value="' + f + '">' + (FRAMING_LABELS[f] || f) + "</option>").join("");
+  }
+  const now = () => Date.now() / 1000;
+
+  // ---- outgoing: capture at 24 fps, JPEG, 8-byte LE double timestamp (seconds, client clock) prefix
+  let sentFrames = 0, sentBytes = 0, tStat = performance.now();
+  let sendW = 288, sendH = 512;
+  // The session takes the camera's own aspect ratio: the page reports the camera frame size when it connects, the
+  // server answers (hello) with the output size it offers closest to that aspect, at its fixed pixel budget; frames
+  // are sent at that size and both panes take its aspect ratio. Only the small remainder is cover-cropped.
+  let camW = 0, camH = 0;
+  const stageEl = document.getElementById("stage");
+  function setAspect(w, h) { if (w && h) stageEl.style.setProperty("--ar", (w / h).toFixed(4)); }
+  function camSize() {
+    const w = latest ? latest.displayWidth : cam.videoWidth, h = latest ? latest.displayHeight : cam.videoHeight;
+    return w && h ? [w, h] : null;
+  }
+  function closestSize(sizes, w, h) {
+    let best = sizes[0], err = Infinity;
+    sizes.forEach((s) => { const e = Math.abs(Math.log(s[0] / s[1] * h / w)); if (e < err) { err = e; best = s; } });
+    return best;
+  }
+  // a phone turned between portrait and landscape (or a camera switch) changes the frame size: reconnect at the new aspect
+  function checkCamAspect() {
+    const cs = camSize();
+    if (!cs || !hello || !hello.sizes || !ws || ws.readyState !== 1) return;
+    const want = closestSize(hello.sizes, cs[0], cs[1]);
+    if (want[0] !== sendW || want[1] !== sendH) { camW = cs[0]; camH = cs[1]; ws.close(4000, "camera aspect changed"); }
+  }
+  let inflight = 0, dropped = 0;
+  // camera frames straight from the track (Chrome: MediaStreamTrackProcessor). Reading through a <video> element froze
+  // on the first frame in Chrome on Windows while the track kept running; the <video> path stays as the fallback.
+  let latest = null, camFrames = 0, trackReader = null;
+  async function startTrackReader(track) {
+    if (!("MediaStreamTrackProcessor" in window)) return false;
+    trackReader = new MediaStreamTrackProcessor({ track: track }).readable.getReader();
+    (async () => {
+      try {
+        while (true) {
+          const r = await trackReader.read();
+          if (r.done) break;
+          if (latest) latest.close();
+          latest = r.value; camFrames++;
+        }
+      } catch (e) { /* track stopped */ }
+    })();
+    return true;
+  }
+  function captureAndSend() {
+    if (!sending || !ws || ws.readyState !== 1) return;
+    if (!latest && cam.readyState < 2) return;
+    if (inflight > 2 || ws.bufferedAmount > 1500000) { dropped++; return; }
+    const src = latest || cam;
+    const vw = latest ? latest.displayWidth : cam.videoWidth, vh = latest ? latest.displayHeight : cam.videoHeight;
+    if (!vw || !vh) return;
+    const tCap = now();
+    const s = Math.max(sendW / vw, sendH / vh);
+    const cw = sendW / s, ch = sendH / s;
+    cctx.drawImage(src, (vw - cw) / 2, (vh - ch) / 2, cw, ch, 0, 0, sendW, sendH);
+    inflight++;
+    capCanvas.toBlob(async (blob) => {
+      inflight--;
+      if (!blob || !ws || ws.readyState !== 1) return;
+      const jpeg = new Uint8Array(await blob.arrayBuffer());
+      const buf = new ArrayBuffer(8 + jpeg.byteLength);
+      new DataView(buf).setFloat64(0, tCap, true);
+      new Uint8Array(buf, 8).set(jpeg);
+      ws.send(buf);
+      sentFrames++; sentBytes += buf.byteLength;
+    }, "image/jpeg", SEND_Q);
+  }
+  function startSending() {
+    sending = true;
+    let next = performance.now();
+    const period = 1000 / FPS;
+    const tick = () => {
+      if (!sending) return;
+      const t = performance.now();
+      if (t >= next) { captureAndSend(); next += period; if (t - next > 500) next = t; }
+      sendTimer = setTimeout(tick, Math.max(0, next - performance.now()));
+    };
+    tick();
+  }
+
+  // ---- incoming
+  const playQ = [];          // {bitmap, tCapture}
+  let playing = false, lastLag = null, windowsIn = 0, lastGen = 0, lastFirst = 0, lastQueue = 0, holdCount = 0, fastCount = 0, lastCfg = "";
+  let recvBytes = 0, lastBitmap = null, pendingMeta = null, pendingV1 = null, pendingV1Frames = [];
+  const bd = []; // per-window breakdown samples (client-side, seconds)
+  function unpack(buf) {
+    const dv = new DataView(buf); const n = dv.getUint32(0, true);
+    const sizes = []; for (let i = 0; i < n; i++) sizes.push(dv.getUint32(4 + 4 * i, true));
+    let off = 4 + 4 * n; const blobs = [];
+    for (let i = 0; i < n; i++) { blobs.push(new Blob([buf.slice(off, off + sizes[i])], { type: "image/jpeg" })); off += sizes[i]; }
+    return blobs;
+  }
+  async function enqueue(meta, blobs, tArrive) {
+    const tDec0 = performance.now();
+    const bitmaps = await Promise.all(blobs.map((b) => createImageBitmap(b)));
+    const decodeS = (performance.now() - tDec0) / 1000;
+    const n = bitmaps.length, W = hello ? hello.window : 39;
+    for (let i = 0; i < n; i++) {
+      const fi = (meta.offset || 0) + i;
+      const tLast = meta.t_last_emit_capture || meta.t_last_capture; // prefix mode: the window reads 5 frames past its last shown one
+      const tc = meta.t_first_capture + (tLast - meta.t_first_capture) * (W > 1 ? fi / (W - 1) : 0);
+      playQ.push({ bitmap: bitmaps[i], tCapture: tc });
+    }
+    if ((meta.offset || 0) === 0) {
+      // breakdown for this window (all in seconds; server timestamps shifted by the clock offset)
+      const srv = (t) => t - clockOffset;
+      bd.push({
+        fill: meta.t_last_capture - meta.t_first_capture,
+        uplink: srv(meta.t_recv_last) - meta.t_last_capture,
+        wait: meta.t_gen_start - meta.t_recv_last,
+        genFirst: meta.t_send - meta.t_gen_start,
+        downlink: tArrive - srv(meta.t_send),
+        decode: decodeS,
+        total: tArrive + decodeS - meta.t_first_capture,
+      });
+      if (bd.length > 8) bd.shift();
+    }
+    if (!playing) startPlayback();
+  }
+  function startPlayback() {
+    playing = true;
+    let next = performance.now();
+    const tick = () => {
+      if (!playing) return;
+      const t = performance.now();
+      if (t >= next) {
+        const f = playQ.shift();
+        if (f) {
+          if (out.width !== f.bitmap.width || out.height !== f.bitmap.height) { out.width = f.bitmap.width; out.height = f.bitmap.height; }
+          octx.drawImage(f.bitmap, 0, 0);
+          if (lastBitmap) lastBitmap.close();
+          lastBitmap = f.bitmap;
+          lastLag = now() - f.tCapture;
+        } else { holdCount++; }
+        // bounded buffer: play a little faster when more than ~1 s is queued, so early arrivals never ratchet the lag up
+        let fps = FPS;
+        if (playQ.length > 24) { fps = 28; fastCount++; }
+        if (playQ.length > 60) { fps = 34; }
+        next += 1000 / fps; if (t - next > 500) next = t;
+      }
+      setTimeout(tick, Math.max(0, next - performance.now()));
+    };
+    tick();
+  }
+
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const tConnect = now();
+    const cs = camSize(); if (cs) { camW = cs[0]; camH = cs[1]; }
+    ws = new WebSocket(proto + "://" + location.host + "/ws?token=" + encodeURIComponent(token) + (camW ? "&cw=" + camW + "&ch=" + camH : ""));
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => { connEl.textContent = "connected"; };
+    ws.onclose = (e) => {
+      sending = false; if (sendTimer) clearTimeout(sendTimer); if (pingTimer) clearInterval(pingTimer);
+      // serverless: the gateway may cap a connection's lifetime, and a busy / still-warming worker closes with 1013
+      connEl.textContent = "closed (" + e.code + (e.reason ? " " + e.reason : "") + ")" + (wanted ? " - reconnecting" : "");
+      if (wanted) setTimeout(connect, e.code === 1013 ? 3000 : 500);
+    };
+    ws.onerror = () => { connEl.textContent = "ws error"; };
+    ws.onmessage = (ev) => {
+      const tArrive = now();
+      if (typeof ev.data === "string") {
+        const m = JSON.parse(ev.data);
+        if (m.type === "hello") {
+          hello = m; sendW = m.w; sendH = m.h; capCanvas.width = sendW; capCanvas.height = sendH;
+          setAspect(sendW, sendH);
+          playQ.forEach((f) => f.bitmap.close()); playQ.length = 0;  // frames of a previous session (other size)
+          document.getElementById("sentCap").textContent = "camera " + (camW ? camW + "x" + camH : "") + " (sent at " + sendW + "x" + sendH + ", 24 fps)";
+          clockOffset = m.server_time - (tConnect + tArrive) / 2;
+          connEl.textContent = "connected - " + m.w + "x" + m.h + " - " + m.window + "-frame windows" + (m.progressive ? " - progressive" : "");
+          applyTask(m.task, m.framings);
+          if (m.config) { curGarment = m.config.garment; framingEl.value = m.config.framing || "auto"; }
+          if (m.garments) renderThumbs(m.garments);
+          sendConfig(curGarment, framingEl.value);
+          startSending();
+          if (pingTimer) clearInterval(pingTimer);
+          pingTimer = setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ping", t_client: now() })); }, 5000);
+        } else if (m.type === "config") {
+          markGarment(m.garment); framingEl.value = m.framing || framingEl.value;
+        } else if (m.type === "pong") {
+          const rtt = tArrive - m.t_client; clockOffset = m.t_server - (m.t_client + tArrive) / 2; bd.rtt = rtt;
+        } else if (m.type === "clip") { pendingMeta = m; }
+        else if (m.type === "window") { if (m.offset === undefined || m.offset === 0) { pendingV1 = m; pendingV1Frames = []; } else { pendingMeta = m; pendingMeta.v1 = true; pendingV1 = m; pendingV1Frames = []; } }
+        else if (m.type === "window_done") { windowsIn++; lastGen = m.gen_s; lastFirst = m.first_clip_s; lastQueue = m.queue_windows; lastCfg = (m.garment || "") + " / " + (m.framing || ""); }
+        return;
+      }
+      recvBytes += ev.data.byteLength;
+      if (pendingMeta && !pendingMeta.v1) { const m = pendingMeta; pendingMeta = null; enqueue(m, unpack(ev.data), tArrive); return; }
+      if (pendingV1) {
+        pendingV1Frames.push(new Blob([ev.data], { type: "image/jpeg" }));
+        if (pendingV1Frames.length === pendingV1.frames) { const m = pendingV1, fr = pendingV1Frames; pendingV1 = null; pendingMeta = null; pendingV1Frames = []; enqueue(m, fr, tArrive); }
+      }
+    };
+  }
+
+  setInterval(() => {
+    const dt = (performance.now() - tStat) / 1000; tStat = performance.now();
+    const sfps = sentFrames / dt, upkb = sentBytes / dt / 1024, downkb = recvBytes / dt / 1024;
+    const cfps = camFrames / dt;
+    sentFrames = 0; sentBytes = 0; recvBytes = 0; camFrames = 0;
+    lagEl.textContent = lastLag == null ? "-" : lastLag.toFixed(2) + " s";
+    checkCamAspect();
+    const avg = (k) => bd.length ? (bd.reduce((a, b) => a + b[k], 0) / bd.length) : 0;
+    detEl.textContent = "camera " + (trackReader ? cfps.toFixed(1) + " fps (track)" : "<video>") + " - send " + sfps.toFixed(1) + " fps - up " + upkb.toFixed(0) + " KB/s - down " + downkb.toFixed(0) +
+      " KB/s - dropped " + dropped + " - rtt " + ((bd.rtt || 0) * 1000).toFixed(0) + " ms\n" +
+      "windows " + windowsIn + " (" + lastCfg + ") - first clip " + lastFirst.toFixed(2) + " s - gen " + lastGen.toFixed(2) + " s - server queue " +
+      lastQueue + " - play buffer " + playQ.length + " f - holds " + holdCount + " - fast " + fastCount + "\n" +
+      (bd.length ? ("to first frame: fill " + avg("fill").toFixed(2) + " + uplink " + avg("uplink").toFixed(2) + " + wait " + avg("wait").toFixed(2) +
+        " + gen1 " + avg("genFirst").toFixed(2) + " + down " + avg("downlink").toFixed(2) + " + decode " + avg("decode").toFixed(2) +
+        " = " + avg("total").toFixed(2) + " s") : "");
+  }, 1000);
+
+  // camera picker: on desktops "front camera" can resolve to a virtual camera (OBS, Broadcast...) showing a still image
+  const camSel = document.getElementById("camdev");
+  async function listCameras() {
+    try {
+      const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+      const cur = camSel.value;
+      camSel.innerHTML = '<option value="">default camera</option>' +
+        devs.map((d, i) => '<option value="' + d.deviceId + '">' + (d.label || "camera " + (i + 1)) + "</option>").join("");
+      camSel.value = cur;
+    } catch (e) { /* no permission yet */ }
+  }
+  listCameras();
+  if (navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener("devicechange", listCameras);
+  document.getElementById("start").onclick = async () => {
+    try {
+      const facing = document.getElementById("facing").value;
+      // no width/height wish: asking for 720x1280 made every camera crop itself to portrait
+      const video = { frameRate: { ideal: 30 } };
+      if (camSel.value) video.deviceId = { exact: camSel.value }; else video.facingMode = facing;
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: video });
+      const used = stream.getVideoTracks()[0];
+      // then ask for the sensor's own aspect ratio at up to 1280 on the long edge (browsers default to 640x480 even
+      // on 16:9 sensors); the frames sent stay at the server's small size either way
+      try {
+        const caps = used.getCapabilities ? used.getCapabilities() : null;
+        const st = used.getSettings();
+        // only when the stream is not rotated against the sensor (a phone held upright reports a landscape sensor
+        // but delivers portrait frames, and browsers disagree on which way constraints apply there)
+        const sameWay = st.width && st.height && caps && caps.width && caps.height && (st.width >= st.height) === (caps.width.max >= caps.height.max);
+        if (sameWay && caps.width.max && caps.height.max) {
+          const k = Math.min(1, 1280 / Math.max(caps.width.max, caps.height.max));
+          await used.applyConstraints({ width: { ideal: Math.round(caps.width.max * k) }, height: { ideal: Math.round(caps.height.max * k) },
+                                        frameRate: { ideal: 30 } });
+        }
+      } catch (e) { /* keep the default mode */ }
+      await listCameras();  // labels are only visible once permission is granted
+      if (used.getSettings().deviceId) camSel.value = used.getSettings().deviceId;
+      cam.srcObject = stream; await cam.play();
+      camW = cam.videoWidth; camH = cam.videoHeight; setAspect(camW, camH);  // panes take the camera's shape at once
+      await startTrackReader(stream.getVideoTracks()[0]);
+      document.getElementById("start").disabled = true; document.getElementById("stop").disabled = false;
+      wanted = true; connect();
+    } catch (e) { connEl.textContent = "camera error: " + e.message; }
+  };
+  document.getElementById("stop").onclick = () => {
+    wanted = false; sending = false; playing = false; if (sendTimer) clearTimeout(sendTimer);
+    if (ws) ws.close(); if (stream) stream.getTracks().forEach((t) => t.stop());
+    if (trackReader) { trackReader.cancel().catch(() => {}); trackReader = null; }
+    if (latest) { latest.close(); latest = null; }
+    document.getElementById("start").disabled = false; document.getElementById("stop").disabled = true;
+  };
+})();
+</script>
+</body>
+</html>

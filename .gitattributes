@@ -1,0 +1,10 @@
+# Scripts are scp'd from Windows to Linux pods: keep LF in the working tree (CRLF breaks `set -o pipefail`).
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+*.mp4 binary
+*.jpg binary
+*.gif binary
+*.png binary
+*.tgz binary

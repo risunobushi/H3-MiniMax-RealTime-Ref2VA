@@ -1,0 +1,11 @@
+H3 MiniMax real-time Ref2VA
+Copyright 2026 Andrea Baioni
+
+This product includes software developed by Andrea Baioni
+(https://github.com/risunobushi/H3-MiniMax-RealTime-Ref2VA).
+
+If you redistribute this work or a derivative of it, in source or binary form, you must keep this NOTICE file
+(Apache License 2.0, section 4). If you use it in research, a product or a demo, please cite it: see CITATION.cff.
+
+The model weights it downloads (MiniMaxAI/MiniMax-H3, lightx2v/Minimax-h3-Turbo) and the ModelTC/Minimax-H3-Turbo
+code it imports are not part of this work and keep their own licenses.
